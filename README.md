@@ -5,8 +5,8 @@
 
 - **Python 版本**: 3.14.7(仅标准库, 安装 Python 后无需任何额外依赖)
 - **平台**: Linux 原生; 核心、测试、演示全部离线
-- **运行测试**: `python -m unittest discover -s tests -v`
-- **运行演示**: `python demo.py`(固定输入, 真实计算, 约毫秒级完成)
+- **运行测试**: `python -m unittest discover -s tests -v`(45 个用例)
+- **运行演示**: `python demo.py`(固定输入, 真实计算, 约毫秒级完成; 含正常结果、边界与实际错误)
 
 ## 接口
 
@@ -36,7 +36,7 @@ result = composite(deep_samples, *, z_far=None)
 
 - `color`: 预乘 RGB 最终色(相对透明背景)。叠到背景上: `apply_background(result, bg)` = `color + transmittance * bg`。
 - `transmittance`: 整束透过率 T ∈ [0,1]。
-- `ledger`: 贡献账本, 每个被合成元素一条 `LedgerEntry(kind, ids, z0, z1, contribution, transmittance_before, transmittance_after)`。**全部条目 `contribution` 求和恰等于 `color`**(可加性, demo 与测试均核验)。
+- `ledger`: 贡献账本, 每个被合成元素一条 `LedgerEntry(kind, ids, z0, z1, contribution, transmittance_before, transmittance_after)`。**全部条目 `contribution` 求和恰等于 `color`**(可加性, demo 与测试均核验)。账本穷举全部小区间与表面: 被不透明表面遮挡的后方元素仍有条目, 但其 `transmittance_before` 与 `contribution` 为 `0`。
 
 ## 预乘与合成约定
 
@@ -75,6 +75,14 @@ result = composite(deep_samples, *, z_far=None)
 deep_composite/      # 可导入库(核心算法, 无第三方依赖)
   __init__.py        # 公开接口导出
   core.py            # 数据结构、校验、合成算法
-tests/test_composite.py  # 26 个单元测试(解析参考独立手算)
-demo.py              # 固定输入演示: 正常结果 + 账本可加核验 + 负 sigma 拒绝
+tests/test_composite.py  # 45 个单元测试(解析参考独立手算 + 60 场景枚举核对)
+demo.py              # 固定输入演示: 正常结果(独立解析核对) + 零消光/遮挡边界 + 实际错误
 ```
+
+## 测试组织
+
+- 单段/双重叠/嵌套/三方重叠的解析参考(测试内独立用 `math.exp` 手算, 不调用被测核心)。
+- 边界: 零消光(单段与重叠)、零长体段、极厚强消光体段后的数值全黑、表面恰在 `z_far`。
+- 遮挡: 不透明表面遮挡后方表面与体段、半透明表面减半后方贡献、体段消光衰减后方表面、不透明表面与同 z 开始体段的顺序。
+- `TestEnumeratedReference`: 固定种子的小规模枚举(60 个随机场景), 与一份独立的逐区间(slab)参考实现逐通道核对, 同时核验账本可加与透过率链; 枚举仅用于交叉验证, 期望值不来自被测实现。
+- 失败用例: 负 sigma、NaN/Inf、bool、rgba/emission 形状与类型、错误 id 类型、`z_far` 非法、条目数超限、错误条目类型、生成器输入、纯函数性(重复调用一致、输入不被修改)。

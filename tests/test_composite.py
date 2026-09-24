@@ -5,6 +5,7 @@
 """
 
 import math
+import random
 import unittest
 
 from deep_composite import (
@@ -14,6 +15,7 @@ from deep_composite import (
     Surface,
     ValidationError,
     VolumeSegment,
+    __all__ as PUBLIC_API,
     apply_background,
     composite,
 )
@@ -283,6 +285,339 @@ class TestValidation(unittest.TestCase):
             self.assertIn("smoke", msg)
         else:
             self.fail("应抛出 NegativeSigmaError")
+
+
+class TestZeroExtinctionOverlap(unittest.TestCase):
+    """零消光边界: 单段、重叠段以及与有消光段混合。"""
+
+    def test_two_zero_sigma_overlapping_segments(self):
+        # A: [0,2] e=(0.3,0,0), B: [1,3] e=(0,0.5,0), 均 sigma=0
+        res = composite(
+            [
+                VolumeSegment(0.0, 2.0, (0.3, 0.0, 0.0), 0.0, id=1),
+                VolumeSegment(1.0, 3.0, (0.0, 0.5, 0.0), 0.0, id=2),
+            ]
+        )
+        # 解析: 无吸收, T 恒为 1, 颜色 = 发射沿深度的积分
+        #   红: 0.3*2 = 0.6 ; 绿: 0.5*2 = 1.0
+        assert_rgb_close(self, res.color, (0.6, 1.0, 0.0))
+        self.assertEqual(res.transmittance, 1.0)
+        self.assertEqual([e.kind for e in res.ledger], ["volume", "volume", "volume"])
+        self.assertEqual(set(res.ledger[1].ids), {1, 2})
+        for e in res.ledger:
+            self.assertEqual(e.transmittance_before, 1.0)
+            self.assertEqual(e.transmittance_after, 1.0)
+
+    def test_zero_sigma_mixed_with_absorbing_segment(self):
+        # A: [0,2] sigma=0 e=(0.3,0,0); B: [1,3] sigma=0.4 e=(0,0.5,0)
+        res = composite(
+            [
+                VolumeSegment(0.0, 2.0, (0.3, 0.0, 0.0), 0.0, id=1),
+                VolumeSegment(1.0, 3.0, (0.0, 0.5, 0.0), 0.4, id=2),
+            ]
+        )
+        # 独立手算: [0,1] 仅 A(σ=0); [1,2] A+B(σ=0.4, e 相加); [2,3] 仅 B
+        c1, t1 = seg((0.3, 0.0, 0.0), 0.0, 1.0)
+        c2, t2 = seg((0.3, 0.5, 0.0), 0.4, 1.0)
+        c3, t3 = seg((0.0, 0.5, 0.0), 0.4, 1.0)
+        want = [c1[i] + t1 * c2[i] + t1 * t2 * c3[i] for i in range(3)]
+        assert_rgb_close(self, res.color, want)
+        self.assertAlmostEqual(res.transmittance, t1 * t2 * t3, delta=TOL)
+
+    def test_all_zero_sigma_scene_transmittance_one(self):
+        # 再加一个半透明表面: 体段不衰减, 只有表面影响 T
+        res = composite(
+            [
+                VolumeSegment(0.0, 4.0, (0.1, 0.1, 0.1), 0.0, id=1),
+                Surface(2.0, (0.0, 0.0, 0.0, 0.25), id=2),
+            ]
+        )
+        self.assertAlmostEqual(res.transmittance, 0.75, delta=TOL)
+
+
+def seg(emission, sigma, length):
+    """测试用独立解析参考(不调用被测核心)。"""
+    if sigma == 0.0:
+        return tuple(ec * length for ec in emission), 1.0
+    x = sigma * length
+    return tuple(ec / sigma * (1.0 - math.exp(-x)) for ec in emission), math.exp(-x)
+
+
+class TestOcclusion(unittest.TestCase):
+    """遮挡: 不透明/半透明表面与体段消光对后方元素的衰减。"""
+
+    def test_opaque_surface_blocks_everything_behind(self):
+        v_front = VolumeSegment(0.0, 2.0, (0.1, 0.0, 0.0), 0.3, id=1)
+        opaque = Surface(2.0, (0.2, 0.2, 0.2, 1.0), id=2)
+        v_back = VolumeSegment(2.0, 4.0, (5.0, 5.0, 5.0), 0.0, id=3)
+        s_behind = Surface(3.0, (1.0, 1.0, 1.0, 1.0), id=4)
+        res = composite([v_back, s_behind, opaque, v_front])
+        c1, t1 = seg((0.1, 0.0, 0.0), 0.3, 2.0)
+        want = [c1[i] + t1 * 0.2 for i in range(3)]
+        assert_rgb_close(self, res.color, want)
+        self.assertEqual(res.transmittance, 0.0)
+        # 后方体段与表面仍在账本中(账本为穷举遍历记录), 但贡献恰为 0
+        behind = [e for e in res.ledger if any(i in e.ids for i in (3, 4))]
+        self.assertTrue(behind)
+        for e in behind:
+            self.assertEqual(e.contribution, (0.0, 0.0, 0.0))
+            self.assertEqual(e.transmittance_before, 0.0)
+
+    def test_translucent_surface_dims_behind_volume(self):
+        # a=0.5 的黑表面只衰减不上色; 后方零消光体段贡献被减半
+        items = [
+            Surface(1.0, (0.0, 0.0, 0.0, 0.5), id=1),
+            VolumeSegment(1.0, 3.0, (0.0, 0.0, 0.4), 0.0, id=2),
+        ]
+        res = composite(items)
+        assert_rgb_close(self, res.color, (0.0, 0.0, 0.5 * 0.4 * 2.0))
+        self.assertAlmostEqual(res.transmittance, 0.5, delta=TOL)
+
+    def test_volume_extinction_occludes_later_surface(self):
+        # 体段不发光只吸收: 后方表面颜色乘 exp(-sigma*L)
+        vol = VolumeSegment(0.0, 2.0, (0.0, 0.0, 0.0), 0.5, id=1)
+        surf = Surface(2.0, (0.6, 0.0, 0.0, 1.0), id=2)
+        res = composite([vol, surf])
+        t_vol = math.exp(-0.5 * 2.0)
+        assert_rgb_close(self, res.color, (t_vol * 0.6, 0.0, 0.0))
+        self.assertEqual(res.transmittance, 0.0)
+
+    def test_nested_volume_is_seen_through_outer(self):
+        # 外段 [0,4] e_blue=0.2 sigma=0.25; 内段 [1,3] e_red=0.3 sigma=0
+        res = composite(
+            [
+                VolumeSegment(0.0, 4.0, (0.0, 0.0, 0.2), 0.25, id=1),
+                VolumeSegment(1.0, 3.0, (0.3, 0.0, 0.0), 0.0, id=2),
+            ]
+        )
+        c1, t1 = seg((0.0, 0.0, 0.2), 0.25, 1.0)
+        c2, t2 = seg((0.3, 0.0, 0.2), 0.25, 2.0)
+        c3, t3 = seg((0.0, 0.0, 0.2), 0.25, 1.0)
+        want = [c1[i] + t1 * c2[i] + t1 * t2 * c3[i] for i in range(3)]
+        assert_rgb_close(self, res.color, want)
+        self.assertAlmostEqual(res.transmittance, t1 * t2 * t3, delta=TOL)
+        # 内段被外段消光遮挡: 它的红贡献恰为 T([0,1]) * (0.3 在内区间的积分)
+        red_inner_only = t1 * c2[0]
+        ledger_red_inner = sum(
+            e.contribution[0] for e in res.ledger if 2 in e.ids
+        )
+        self.assertAlmostEqual(ledger_red_inner, red_inner_only, delta=TOL)
+
+    def test_fully_absorbing_volume_black_behind(self):
+        # 极厚强消光体段: 后方表面贡献数值上为 0
+        vol = VolumeSegment(0.0, 50.0, (0.0, 0.0, 0.0), 100.0, id=1)
+        surf = Surface(50.0, (1.0, 1.0, 1.0, 1.0), id=2)
+        res = composite([vol, surf])
+        assert_rgb_close(self, res.color, (0.0, 0.0, 0.0))
+        self.assertEqual(res.transmittance, 0.0)
+
+
+class TestOverlapGeometry(unittest.TestCase):
+    """重叠几何: 包含、三方重叠、端点相接。"""
+
+    def test_nested_segments_intervals(self):
+        res = composite(
+            [
+                VolumeSegment(0.0, 4.0, (0.1, 0.0, 0.0), 0.2, id=1),
+                VolumeSegment(1.0, 3.0, (0.0, 0.2, 0.0), 0.3, id=2),
+            ]
+        )
+        self.assertEqual(
+            [(e.z0, e.z1) for e in res.ledger], [(0.0, 1.0), (1.0, 3.0), (3.0, 4.0)]
+        )
+        self.assertEqual([e.ids for e in res.ledger], [(1,), (1, 2), (1,)])
+        c1, t1 = seg((0.1, 0.0, 0.0), 0.2, 1.0)
+        c2, t2 = seg((0.1, 0.2, 0.0), 0.5, 2.0)
+        c3, t3 = seg((0.1, 0.0, 0.0), 0.2, 1.0)
+        want = [c1[i] + t1 * c2[i] + t1 * t2 * c3[i] for i in range(3)]
+        assert_rgb_close(self, res.color, want)
+
+    def test_three_way_overlap(self):
+        # [0,3] / [1,4] / [2,5], 全部零消光, 便于逐区间核对
+        res = composite(
+            [
+                VolumeSegment(0.0, 3.0, (0.1, 0.0, 0.0), 0.0, id=1),
+                VolumeSegment(1.0, 4.0, (0.0, 0.1, 0.0), 0.0, id=2),
+                VolumeSegment(2.0, 5.0, (0.0, 0.0, 0.1), 0.0, id=3),
+            ]
+        )
+        expected_intervals = [(0, 1), (1, 2), (2, 3), (3, 4), (4, 5)]
+        self.assertEqual(
+            [(e.z0, e.z1) for e in res.ledger], expected_intervals
+        )
+        self.assertEqual(
+            [set(e.ids) for e in res.ledger],
+            [{1}, {1, 2}, {1, 2, 3}, {2, 3}, {3}],
+        )
+        # 红: 0.1*3=0.3 ; 绿: 0.1*3=0.3 ; 蓝: 0.1*3=0.3
+        assert_rgb_close(self, res.color, (0.3, 0.3, 0.3))
+        self.assertEqual(res.transmittance, 1.0)
+
+    def test_touching_segments_do_not_merge(self):
+        res = composite(
+            [
+                VolumeSegment(0.0, 1.0, (0.2, 0.0, 0.0), 0.5, id=1),
+                VolumeSegment(1.0, 2.0, (0.2, 0.0, 0.0), 0.5, id=2),
+            ]
+        )
+        self.assertEqual(len(res.ledger), 2)
+        self.assertEqual([e.ids for e in res.ledger], [(1,), (2,)])
+        # 相接与整段完全等价(分段不变性的另一形式)
+        whole = composite([VolumeSegment(0.0, 2.0, (0.2, 0.0, 0.0), 0.5, id=9)])
+        assert_rgb_close(self, res.color, whole.color)
+        self.assertAlmostEqual(
+            res.transmittance, whole.transmittance, delta=TOL
+        )
+
+
+def _slab_reference(items, z_far=None):
+    """独立枚举参考: 按事件坐标逐开区间 + 坐标点表面推进。
+
+    与被测实现分开手写: 区间归属用中点包含判定, 小区间解析积分,
+    表面在区间之后按 (int 优先, id) 顺序应用。
+    """
+    surfaces = []
+    spans = []
+    for it in items:
+        if isinstance(it, Surface):
+            if z_far is None or it.z <= z_far:
+                surfaces.append(it)
+        else:
+            if it.z0 == it.z1:
+                continue
+            z1 = it.z1 if z_far is None else min(it.z1, z_far)
+            if z1 <= it.z0:
+                continue
+            spans.append((it.z0, z1, it.emission, it.sigma, it.id))
+
+    coords = sorted({z for a, b, *_ in spans for z in (a, b)} | {s.z for s in surfaces})
+    surf_at = {}
+    for s in surfaces:
+        surf_at.setdefault(s.z, []).append(s)
+
+    color = [0.0, 0.0, 0.0]
+    t = 1.0
+    for k, z in enumerate(coords):
+        if k > 0:
+            a, b = coords[k - 1], z
+            if b > a:
+                mid = (a + b) / 2.0
+                sig = 0.0
+                emi = [0.0, 0.0, 0.0]
+                for za, zb, e, s, _i in spans:
+                    if za <= mid <= zb:  # 端点相接只可能落在单点, 区间长度为 0
+                        sig += s
+                        emi[0] += e[0]
+                        emi[1] += e[1]
+                        emi[2] += e[2]
+                c_seg, t_seg = seg((emi[0], emi[1], emi[2]), sig, b - a)
+                for ch in range(3):
+                    color[ch] += t * c_seg[ch]
+                t *= t_seg
+        for s in sorted(surf_at.get(z, ()), key=lambda x: (0, x.id) if isinstance(x.id, int) else (1, x.id)):
+            for ch in range(3):
+                color[ch] += t * s.rgba[ch]
+            t *= 1.0 - s.rgba[3]
+    return (color[0], color[1], color[2]), t
+
+
+class TestEnumeratedReference(unittest.TestCase):
+    """小规模随机枚举: 与独立 slab 参考逐场景核对(含零消光、遮挡、重叠)。"""
+
+    def test_random_scenes_against_slab_reference(self):
+        rng = random.Random(20260924)
+        sigmas = [0.0, 0.0, 0.2, 0.75, 2.0]
+        emissions = [0.0, 0.15, 0.4, 1.2]
+        depths = [0.0, 1.0, 2.0, 3.0, 4.0]
+        alphas = [0.0, 0.25, 0.5, 1.0]
+        for scene_idx in range(60):
+            items = []
+            for vid in range(rng.randrange(1, 5)):
+                a = rng.choice(depths)
+                b = a + rng.choice([0.0, 1.0, 2.0])
+                e = tuple(rng.choice(emissions) for _ in range(3))
+                items.append(VolumeSegment(a, b, e, rng.choice(sigmas), id=f"v{vid}"))
+            for sid in range(rng.randrange(0, 4)):
+                rgb = tuple(rng.choice([0.0, 0.2, 0.6]) for _ in range(3))
+                items.append(
+                    Surface(rng.choice(depths), rgb + (rng.choice(alphas),), id=sid)
+                )
+            z_far = rng.choice([None, None, 2.0, 5.0])
+            res = composite(items, z_far=z_far)
+            want_c, want_t = _slab_reference(items, z_far)
+            assert_rgb_close(self, res.color, want_c, tol=1e-11)
+            self.assertAlmostEqual(res.transmittance, want_t, delta=1e-11)
+            # 每个枚举场景都核验账本可加与透过率链
+            sums = [0.0, 0.0, 0.0]
+            for e in res.ledger:
+                for ch in range(3):
+                    sums[ch] += e.contribution[ch]
+            assert_rgb_close(self, sums, res.color, tol=1e-12)
+            for prev, cur in zip(res.ledger, res.ledger[1:]):
+                self.assertEqual(prev.transmittance_after, cur.transmittance_before)
+
+
+class TestAdditionalValidation(unittest.TestCase):
+    def test_z_far_inf_rejected(self):
+        with self.assertRaises(ValidationError):
+            composite([Surface(1.0, (0.1, 0.1, 0.1, 0.5))], z_far=float("inf"))
+
+    def test_id_wrong_types(self):
+        for bad in (1.5, None, (1,), [1]):
+            with self.assertRaises(ValidationError, msg=f"id={bad!r}"):
+                Surface(1.0, (0.1, 0.1, 0.1, 0.5), id=bad)
+            with self.assertRaises(ValidationError, msg=f"id={bad!r}"):
+                VolumeSegment(0.0, 1.0, (0.1, 0.1, 0.1), 0.1, id=bad)
+
+    def test_emission_shape_and_component_types(self):
+        with self.assertRaises(ValidationError):
+            VolumeSegment(0.0, 1.0, (0.1, 0.1), 0.1)  # 长度不为 3
+        with self.assertRaises(ValidationError):
+            VolumeSegment(0.0, 1.0, "rgb", 0.1)
+        with self.assertRaises(ValidationError):
+            VolumeSegment(0.0, 1.0, (0.1, "x", 0.1), 0.1)
+
+    def test_rgba_component_type(self):
+        with self.assertRaises(ValidationError):
+            Surface(1.0, (0.1, 0.1, None, 0.5))
+
+    def test_apply_background_validation(self):
+        res = composite([Surface(1.0, (0.5, 0.0, 0.0, 0.5))])
+        with self.assertRaises(ValidationError):
+            apply_background(res, (0.1, 0.1))  # 长度不为 3
+        with self.assertRaises(ValidationError):
+            apply_background(res, (0.1, float("nan"), 0.1))
+
+    def test_accepts_generator_and_is_pure(self):
+        gen = (
+            VolumeSegment(float(i), float(i + 1), (0.1, 0.0, 0.0), 0.0, id=i)
+            for i in range(3)
+        )
+        res = composite(gen)
+        assert_rgb_close(self, res.color, (0.3, 0.0, 0.0))
+        items = [
+            VolumeSegment(0.0, 2.0, (0.3, 0.1, 0.0), 0.4, id=1),
+            Surface(1.0, (0.2, 0.2, 0.2, 0.5), id=2),
+        ]
+        snapshot = list(items)
+        first = composite(items)
+        second = composite(items)  # 重复调用结果一致, 输入不被破坏
+        self.assertEqual(first.color, second.color)
+        self.assertEqual(first.transmittance, second.transmittance)
+        self.assertEqual(items, snapshot)
+        # 输入条目本身不可变
+        with self.assertRaises(AttributeError):
+            items[0].sigma = 9.0
+
+    def test_public_api_surface(self):
+        # 公开入口稳定: README 列出的名字全部可导入
+        for name in (
+            "Surface", "VolumeSegment", "composite", "apply_background",
+            "CompositeResult", "LedgerEntry", "MAX_ITEMS",
+            "DeepCompositeError", "ValidationError",
+            "NegativeSigmaError", "ItemLimitError",
+        ):
+            self.assertIn(name, PUBLIC_API)
 
 
 if __name__ == "__main__":
