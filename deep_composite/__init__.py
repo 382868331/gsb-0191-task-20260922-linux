@@ -3,6 +3,10 @@
 公开接口:
     Surface, VolumeSegment   —— 输入条目(构造时即校验)
     composite(deep_samples, *, z_far=None) -> CompositeResult
+    composite_range(deep_samples, z_near, z_far) -> CompositeResult
+        半开深度窗 [z_near, z_far) 的独立合成(窗前遮挡不带入)
+    combine_results(first, second) -> CompositeResult
+        按 C = C1 + T1*C2, T = T1*T2 拼回相邻窗口
     apply_background(result, background) -> (r, g, b)
     CompositeResult(color, transmittance, ledger)
     LedgerEntry
@@ -21,7 +25,9 @@ from .core import (
     ValidationError,
     VolumeSegment,
     apply_background,
+    combine_results,
     composite,
+    composite_range,
 )
 
 __all__ = [
@@ -35,7 +41,9 @@ __all__ = [
     "ValidationError",
     "VolumeSegment",
     "apply_background",
+    "combine_results",
     "composite",
+    "composite_range",
 ]
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
