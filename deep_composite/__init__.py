@@ -3,11 +3,9 @@
 公开接口:
     Surface, VolumeSegment   —— 输入条目(构造时即校验)
     composite(deep_samples, *, z_far=None) -> CompositeResult
+    composite_range(deep_samples, z_near, z_far) -> CompositeResult
+    combine_results(first, second) -> CompositeResult
     apply_background(result, background) -> (r, g, b)
-    CompositeResult(color, transmittance, ledger)
-    LedgerEntry
-    MAX_ITEMS
-    DeepCompositeError, ValidationError, NegativeSigmaError, ItemLimitError
 """
 
 from .core import (
@@ -21,7 +19,9 @@ from .core import (
     ValidationError,
     VolumeSegment,
     apply_background,
+    combine_results,
     composite,
+    composite_range,
 )
 
 __all__ = [
@@ -35,7 +35,9 @@ __all__ = [
     "ValidationError",
     "VolumeSegment",
     "apply_background",
+    "combine_results",
     "composite",
+    "composite_range",
 ]
 
 __version__ = "1.0.0"

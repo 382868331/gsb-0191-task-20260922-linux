@@ -25,6 +25,13 @@
        int 排在 str 前(确定性 tie-break, 不报错)。
     4. 可选 z_far 截断远平面: z > z_far 的表面被丢弃, 体段被截到 z_far。
 
+深度窗合成(composite_range):
+    只合成半开窗口 [z_near, z_far) 内的内容, 用于考察某段深度对最终色的
+    独立贡献。体段裁剪到窗口后按截后长度重新解析积分; 表面恰在 z_near
+    计入、恰在 z_far 排除。窗口结果与窗前内容无关(透过率从 1.0 起算),
+    相邻窗口可按 C = C1 + T1*C2, T = T1*T2 拼回整段(见 combine_results)。
+    空窗口(含 z_near == z_far)返回零色与透过率 1; z_far < z_near 拒绝。
+
 错误语义:
     所有非法输入在 composite() 返回前抛出, 函数为纯函数, 失败不留部分
     结果。错误类型见模块顶部异常类; 消息包含条目序号/ID 与字段名, 可定位。
@@ -47,6 +54,8 @@ __all__ = [
     "LedgerEntry",
     "CompositeResult",
     "composite",
+    "composite_range",
+    "combine_results",
     "apply_background",
 ]
 
@@ -236,64 +245,58 @@ def _segment_color_and_transmittance(emission: Rgb, sigma: float, length: float)
     ), t
 
 
-def composite(
-    deep_samples: Iterable[Union[Surface, VolumeSegment]],
-    *,
-    z_far: Optional[float] = None,
-) -> CompositeResult:
-    """合成一个像素的深度样本, 返回最终色、透过率与贡献账本。
-
-    参数:
-        deep_samples: Surface / VolumeSegment 的可迭代对象, 至多 MAX_ITEMS 项。
-        z_far: 可选截断远平面; z > z_far 的表面被丢弃, 体段截断到 z_far。
-
-    抛出:
-        ItemLimitError: 条目数超过 MAX_ITEMS。
-        NegativeSigmaError: 某体段 sigma 为负(构造时已校验, 此处为防御)。
-        ValidationError: 其他非法输入(类型、NaN/Inf、越界等)。
-
-    本函数为纯函数: 任何校验失败都在产生结果之前抛出, 不留部分变更。
-    """
+def _validate_items(deep_samples, ctx: str = "composite"):
+    """公共输入校验: 可迭代、条目类型、条目数上限。返回条目列表。"""
     if isinstance(deep_samples, (str, bytes)):
-        raise ValidationError("composite: deep_samples 须为样本条目的可迭代对象")
+        raise ValidationError(f"{ctx}: deep_samples 须为样本条目的可迭代对象")
     try:
         items = list(deep_samples)
     except TypeError as exc:
-        raise ValidationError(
-            f"composite: deep_samples 不可迭代: {exc}"
-        ) from exc
+        raise ValidationError(f"{ctx}: deep_samples 不可迭代: {exc}") from exc
 
     if len(items) > MAX_ITEMS:
         raise ItemLimitError(
-            f"composite: 条目数 {len(items)} 超过上限 MAX_ITEMS={MAX_ITEMS}"
+            f"{ctx}: 条目数 {len(items)} 超过上限 MAX_ITEMS={MAX_ITEMS}"
         )
 
     for i, it in enumerate(items):
         if not isinstance(it, (Surface, VolumeSegment)):
             raise ValidationError(
-                f"composite: 第 {i} 项须为 Surface 或 VolumeSegment, "
+                f"{ctx}: 第 {i} 项须为 Surface 或 VolumeSegment, "
                 f"得到 {type(it).__name__}({it!r})"
             )
+    return items
 
-    if z_far is not None:
-        z_far = _check_real(z_far, "z_far", "composite")
 
-    # --- 截断远平面(显式变换, 不静默: 被丢弃/截断的语义写入文档) ---
+def _clip_items(items, z_near: Optional[float], z_far: Optional[float]):
+    """按半开窗口 [z_near, z_far) 裁剪。
+
+    表面: 恰在 z_near 计入(z_near 为 None 时无下界), 恰在 z_far 排除;
+    体段: 与窗口求交后按截后长度保留(z0 == z1 的零长段/完全在外的丢弃)。
+    返回 (surfaces, volumes), volumes 元素为 (z0, z1, emission, sigma, id)。
+    """
     surfaces = []
     volumes = []
     for it in items:
         if isinstance(it, Surface):
-            if z_far is None or it.z <= z_far:
+            if (z_near is None or it.z >= z_near) and (
+                z_far is None or it.z < z_far
+            ):
                 surfaces.append(it)
         else:
             if it.z0 == it.z1:
                 continue  # 零长段无贡献
+            z0 = it.z0 if z_near is None else max(it.z0, z_near)
             z1 = it.z1 if z_far is None else min(it.z1, z_far)
-            if z1 <= it.z0:
-                continue  # 完全在远平面之外
-            volumes.append((it.z0, z1, it.emission, it.sigma, it.id))
+            if z1 <= z0:
+                continue  # 与窗口无正长度交集
+            volumes.append((z0, z1, it.emission, it.sigma, it.id))
+    return surfaces, volumes
 
-    # --- 体段端点切分: 收集所有边界坐标 ---
+
+def _composite_clipped(surfaces, volumes) -> CompositeResult:
+    """对已裁剪的表面/体段执行 front-to-back 合成(共享内核)。"""
+    # --- 体段端点(与表面深度)切分: 收集所有边界坐标 ---
     coords = set()
     for z0, z1, _e, _s, _i in volumes:
         coords.add(z0)
@@ -378,6 +381,131 @@ def composite(
         transmittance=transmittance,
         ledger=tuple(ledger),
     )
+
+
+def composite(
+    deep_samples: Iterable[Union[Surface, VolumeSegment]],
+    *,
+    z_far: Optional[float] = None,
+) -> CompositeResult:
+    """合成一个像素的深度样本, 返回最终色、透过率与贡献账本。
+
+    参数:
+        deep_samples: Surface / VolumeSegment 的可迭代对象, 至多 MAX_ITEMS 项。
+        z_far: 可选截断远平面; z > z_far 的表面被丢弃(恰在 z_far 的保留),
+            体段截断到 z_far。
+
+    抛出:
+        ItemLimitError: 条目数超过 MAX_ITEMS。
+        NegativeSigmaError: 某体段 sigma 为负(构造时已校验, 此处为防御)。
+        ValidationError: 其他非法输入(类型、NaN/Inf、越界等)。
+
+    本函数为纯函数: 任何校验失败都在产生结果之前抛出, 不留部分变更。
+    """
+    items = _validate_items(deep_samples, ctx="composite")
+
+    if z_far is not None:
+        z_far = _check_real(z_far, "z_far", "composite")
+
+    # 旧接口语义: 仅上界截断, 且恰在 z_far 的表面保留(闭区间上界)。
+    surfaces, volumes = _clip_items(items, None, None)
+    if z_far is not None:
+        surfaces = [s for s in surfaces if s.z <= z_far]
+        volumes = [
+            (z0, min(z1, z_far), e, s, iid)
+            for (z0, z1, e, s, iid) in volumes
+            if min(z1, z_far) > z0
+        ]
+    return _composite_clipped(surfaces, volumes)
+
+
+def composite_range(
+    deep_samples: Iterable[Union[Surface, VolumeSegment]],
+    z_near: float,
+    z_far: float,
+) -> CompositeResult:
+    """只合成半开深度窗 [z_near, z_far) 内的内容, 返回窗口的独立结果。
+
+    与 composite 的关键区别: 本函数不应用窗前遮挡 —— 透过率从 1.0 起算,
+    返回的是窗口自身的颜色贡献与透过率, 而非"从相机看到的结果"。体段先
+    裁剪到窗口, 再按截后长度重新解析积分(不携带窗外的光学厚度); 表面
+    恰在 z_near 计入、恰在 z_far 排除。
+
+    参数:
+        deep_samples: Surface / VolumeSegment 的可迭代对象, 至多 MAX_ITEMS 项。
+        z_near: 窗口近界(含), 有限实数。
+        z_far: 窗口远界(不含), 有限实数, 须满足 z_far >= z_near。
+
+    返回:
+        CompositeResult。空窗口(无表面、无正长度体段交集, 含 z_near == z_far)
+        的 color 为零、transmittance 为 1、ledger 为空。账本条目保留原始
+        样本 id, 体段条目的 z0/z1 为裁剪后范围。
+
+    抛出:
+        ValidationError: z_near/z_far 非法(非有限值或 z_far < z_near),
+            或 deep_samples 非法。
+        ItemLimitError: 条目数超过 MAX_ITEMS。
+
+    相邻(按深度不交)窗口结果可用 combine_results 拼回整段:
+        C = C1 + T1*C2, T = T1*T2。
+    """
+    items = _validate_items(deep_samples, ctx="composite_range")
+    z_near = _check_real(z_near, "z_near", "composite_range")
+    z_far = _check_real(z_far, "z_far", "composite_range")
+    if z_far < z_near:
+        raise ValidationError(
+            f"composite_range: 须满足 z_far >= z_near, "
+            f"得到 z_near={z_near!r}, z_far={z_far!r}(反向窗口拒绝)"
+        )
+    surfaces, volumes = _clip_items(items, z_near, z_far)
+    return _composite_clipped(surfaces, volumes)
+
+
+def combine_results(
+    first: CompositeResult, second: CompositeResult
+) -> CompositeResult:
+    """按 front-to-back 顺序拼接两个相邻窗口的独立结果。
+
+        C   = C1 + T1 * C2
+        T   = T1 * T2
+
+    要求两窗口沿深度轴相邻且不交(调用方负责; 本函数只做代数拼接, 不检查
+    窗口坐标)。账本为两窗口账本的顺序拼接: 第二段条目的 transmittance
+    相对于拼接后的起点重算(颜色贡献同步乘上 T1), 以保持账本链完整且
+    贡献求和恰等于拼回后的 color。
+    """
+    if not isinstance(first, CompositeResult) or not isinstance(second, CompositeResult):
+        raise ValidationError(
+            "combine_results: 两个参数均须为 CompositeResult"
+        )
+    t1 = first.transmittance
+    color = (
+        first.color[0] + t1 * second.color[0],
+        first.color[1] + t1 * second.color[1],
+        first.color[2] + t1 * second.color[2],
+    )
+    transmittance = t1 * second.transmittance
+
+    ledger = list(first.ledger)
+    for e in second.ledger:
+        before = t1 * e.transmittance_before
+        after = t1 * e.transmittance_after
+        ledger.append(
+            LedgerEntry(
+                kind=e.kind,
+                ids=e.ids,
+                z0=e.z0,
+                z1=e.z1,
+                contribution=(
+                    t1 * e.contribution[0],
+                    t1 * e.contribution[1],
+                    t1 * e.contribution[2],
+                ),
+                transmittance_before=before,
+                transmittance_after=after,
+            )
+        )
+    return CompositeResult(color=color, transmittance=transmittance, ledger=tuple(ledger))
 
 
 def apply_background(result: CompositeResult, background: Sequence[float]) -> Rgb:
