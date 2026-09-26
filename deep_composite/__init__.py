@@ -4,6 +4,7 @@
     Surface, VolumeSegment   —— 输入条目(构造时即校验)
     composite(deep_samples, *, z_far=None) -> CompositeResult
     apply_background(result, background) -> (r, g, b)
+    simplify_surfaces(surfaces, *, tolerance) -> SimplifyResult
     CompositeResult(color, transmittance, ledger)
     LedgerEntry
     MAX_ITEMS
@@ -22,6 +23,8 @@ from .core import (
     VolumeSegment,
     apply_background,
     composite,
+    SimplifyResult,
+    simplify_surfaces,
 )
 
 __all__ = [
@@ -36,6 +39,8 @@ __all__ = [
     "VolumeSegment",
     "apply_background",
     "composite",
+    "SimplifyResult",
+    "simplify_surfaces",
 ]
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
