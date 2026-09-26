@@ -17,11 +17,13 @@ from .core import (
     ItemLimitError,
     LedgerEntry,
     NegativeSigmaError,
+    SimplificationResult,
     Surface,
     ValidationError,
     VolumeSegment,
     apply_background,
     composite,
+    simplify_surfaces,
 )
 
 __all__ = [
@@ -31,11 +33,13 @@ __all__ = [
     "ItemLimitError",
     "LedgerEntry",
     "NegativeSigmaError",
+    "SimplificationResult",
     "Surface",
     "ValidationError",
     "VolumeSegment",
     "apply_background",
     "composite",
+    "simplify_surfaces",
 ]
 
 __version__ = "1.0.0"

@@ -3,10 +3,11 @@
 离线渲染用的可复用合成模块: 把一个像素的一组深度样本(半透明表面 + 均匀体段)
 按从前到后(front-to-back)顺序解析合成为最终色、透过率与贡献账本。
 
-- **Python 版本**: 3.14.7(仅标准库, 安装 Python 后无需任何额外依赖)
-- **平台**: Linux 原生; 核心、测试、演示全部离线
-- **运行测试**: `python -m unittest discover -s tests -v`
-- **运行演示**: `python demo.py`(固定输入, 真实计算, 约毫秒级完成)
+ - **Python 版本**: 3.14.7(仅标准库, 安装 Python 后无需任何额外依赖)
+ - **平台**: Linux 原生; 核心、测试、演示全部离线
+ - **环境准备**: `python3.14 -m venv .venv && source .venv/bin/activate`(仓库已附 .venv 时直接激活即可; 无第三方依赖, 无需 pip install)
+ - **运行测试**: `python -m unittest discover -s tests -v`
+ - **运行演示**: `python demo.py`(合成基础演示)与 `python demo_iteration.py`(表面简化演示), 固定输入、真实计算, 均毫秒级完成
 
 ## 接口
 
@@ -19,6 +20,27 @@ from deep_composite import (
 
 result = composite(deep_samples, *, z_far=None)
 ```
+
+### 表面样本简化(新接口, 仅 Surface)
+
+```python
+from deep_composite import simplify_surfaces, SimplificationResult
+
+result = simplify_surfaces(surfaces, *, tolerance=0.05)
+# result.surfaces   -> 压缩后的 Surface 元组, 可直接送回 composite()
+# result.max_error  -> 实际最大误差(各原深度边界、RGBA 四通道取最大)
+# result.worst_z    -> 达到最大误差的原深度边界(空输入为 None)
+# result.group_ends -> 分组终点深度序列(平局裁定依据)
+```
+
+- **只接受 `Surface`**; 传入 `VolumeSegment` 抛 `ValidationError`(体段仍走 `composite` 旧接口, 不参与简化)。
+- 样本先按 `(z, id)` 排序; 候选分组**只在不同深度之间分界**(同深度的 Surface 不拆开)。每组二选一:
+  - **折叠**: 整段按原合成公式压成一个 Surface(`C = Σ Tᵢcᵢ, A = 1 − Π(1−aᵢ)`), 放在该段**最后一个深度**, id 取段内最后一个原 Surface 的 id;
+  - **原样保留**: 仅当该组恰含一个深度时, 保留该深度全部原 Surface。
+- **误差口径**: 前缀颜色/透过率在相邻深度间恒定, 故只需核对每个**原深度边界之后**的前缀量; 要求压缩前后各通道(RGB + 透过率)绝对误差 ≤ `tolerance`(允许 0, 即只接受零误差压缩)。
+- **最优目标**: 输出样本数最少; 平局时按分组终点深度序列字典序最小选择(动态规划求解; 回归测试对小序列用全枚举暴力解核对最优值)。
+- **超预乘保护**: 原 Surface 允许超预乘颜色; 若某段折叠颜色超出 `[0,1]` 合法范围, 该候选段被**禁用**, 绝不钳制颜色。
+- 原输入不被修改(输出为新 Surface 序列); 条目数上限同样为 `MAX_ITEMS = 100`, 超出抛 `ItemLimitError`; `tolerance` 须为非负有限实数(拒绝 NaN/Inf/负数/bool)。
 
 ### 输入条目(构造时即校验)
 
@@ -67,7 +89,8 @@ result = composite(deep_samples, *, z_far=None)
 - **重叠体段在小区间内合并**(σ、e 分别相加)后再积分, 账本按合并后的小区间记账(`ids` 列出全部参与条目), 不做逐条目的重叠区归因。
 - 仅实现本题契约的合成模型: 不含散射、折射、非均匀介质或体纹理; 不宣称兼容任何行业深阴影图/deep pixel 标准。
 - 表面不强制 `rgb <= a` 的预乘不变式(仅要求各通道 ∈ [0,1])。
-- 复杂度 O(N²) 量级(N ≤ 100, 每区间扫描活动体段), 对接口上限足够; 非大数据结构优化目标。
+ - 复杂度 O(N²) 量级(N ≤ 100, 每区间扫描活动体段), 对接口上限足够; 非大数据结构优化目标。
+- 表面简化为动态规划精确求最优(深度组数 m 时 O(m²·N)), 非贪心近似; 误差比较含 1e-12 浮点松弛, 仅吸收舍入误差, 不用来放宽阈值口径。
 
 ## 文件结构
 
@@ -76,5 +99,7 @@ deep_composite/      # 可导入库(核心算法, 无第三方依赖)
   __init__.py        # 公开接口导出
   core.py            # 数据结构、校验、合成算法
 tests/test_composite.py  # 26 个单元测试(解析参考独立手算)
+tests/test_simplify.py   # 12 个简化测试(小序列全枚举核对最优值)
 demo.py              # 固定输入演示: 正常结果 + 账本可加核验 + 负 sigma 拒绝
+demo_iteration.py    # 迭代演示: 误差预算内压缩 + 超预乘折叠越界禁用
 ```

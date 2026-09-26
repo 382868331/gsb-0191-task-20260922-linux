@@ -48,10 +48,15 @@ __all__ = [
     "CompositeResult",
     "composite",
     "apply_background",
+    "SimplificationResult",
+    "simplify_surfaces",
 ]
 
 #: 每次 composite() 调用允许的最大条目数(接口边界)。
 MAX_ITEMS = 100
+
+#: 简化误差比较用的浮点松弛(仅吸收舍入误差, 不做颜色钳制)。
+_SIMPLIFY_EPS = 1e-12
 
 Rgb = Tuple[float, float, float]
 ItemId = Union[int, str]
@@ -389,3 +394,222 @@ def apply_background(result: CompositeResult, background: Sequence[float]) -> Rg
         result.color[1] + t * bg[1],
         result.color[2] + t * bg[2],
     )
+
+
+# ---------------------------------------------------------------------------
+# 表面样本简化(仅 Surface; VolumeSegment 仍走 composite 旧接口)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class SimplificationResult:
+    """simplify_surfaces() 的结果。
+
+    surfaces:   压缩后的 Surface 序列(按 (z, id) 排序), 可直接送回 composite()。
+    max_error:  全部原深度边界上, 压缩前后前缀颜色(RGB)与透过率各通道
+                绝对误差的最大值(实际误差, 非上界估计)。
+    worst_z:    达到 max_error 的原深度边界(并列时取最浅者); 空输入为 None。
+    group_ends: 分组终点深度序列(每组压缩/保留的最后一个深度), 用于平局裁定。
+    """
+
+    surfaces: Tuple[Surface, ...]
+    max_error: float
+    worst_z: Optional[float]
+    group_ends: Tuple[float, ...]
+
+
+def _fold_surfaces(surfaces: Sequence[Surface]):
+    """把 front-to-back 的表面序列按原合成公式折叠成单个 (rgb, alpha)。
+
+    C = sum_i (prod_{j<i} (1-a_j)) * c_i ;  A = 1 - prod_i (1-a_i)
+    与 composite() 对同一序列的累计结果在数学上完全一致。
+    """
+    acc = [0.0, 0.0, 0.0]
+    transmittance = 1.0
+    for s in surfaces:
+        r, g, b, a = s.rgba
+        acc[0] += transmittance * r
+        acc[1] += transmittance * g
+        acc[2] += transmittance * b
+        transmittance *= 1.0 - a
+    return (acc[0], acc[1], acc[2]), 1.0 - transmittance
+
+
+def _prefix_function(surfaces: Sequence[Surface], eval_depths: Sequence[float]):
+    """计算每个评估深度边界之后的前缀颜色与透过率(两侧在相邻深度间恒定)。"""
+    by_depth = {}
+    for s in surfaces:
+        by_depth.setdefault(s.z, []).append(s)
+    acc = [0.0, 0.0, 0.0]
+    transmittance = 1.0
+    out = []
+    for z in eval_depths:
+        for s in by_depth.get(z, ()):
+            r, g, b, a = s.rgba
+            acc[0] += transmittance * r
+            acc[1] += transmittance * g
+            acc[2] += transmittance * b
+            transmittance *= 1.0 - a
+        out.append(((acc[0], acc[1], acc[2]), transmittance))
+    return out
+
+
+def simplify_surfaces(
+    surfaces: Iterable[Surface],
+    *,
+    tolerance: float,
+) -> SimplificationResult:
+    """在误差预算内压缩表面样本, 保留最少样本数(本接口只接受 Surface)。
+
+    模型: 把样本按 (z, id) 排序后, 前缀颜色/透过率在相邻深度之间恒定,
+    因此只需在每个原深度边界之后核对压缩前后的前缀量。候选分组只在
+    不同深度之间分界(同深度的 Surface 不拆开), 每个分组二选一:
+      - 折叠: 整段按原合成公式压成一个 Surface, 放在该段最后一个深度,
+        id 取段内最后(最靠后)一个原 Surface 的 id;
+      - 原样保留: 仅当该组恰含一个深度时, 保留该深度全部原 Surface。
+    约束: 每个原深度边界之后, 前缀颜色 RGB 与透过率各通道的绝对误差
+    不超过 tolerance; 若某段折叠颜色超出 Surface 合法范围 [0,1],
+    该候选段被禁用(绝不钳制颜色)。
+    目标: 输出样本数最少; 平局时按分组终点深度序列字典序最小选择。
+
+    参数:
+        surfaces: 仅含 Surface 的可迭代对象, 至多 MAX_ITEMS 项; 不修改原输入。
+        tolerance: 非负有限实数, 各通道绝对误差阈值(允许 0, 即只接受零误差压缩)。
+
+    抛出:
+        ValidationError: 含非 Surface 条目(VolumeSegment 请走 composite)、
+            tolerance 非法、条目数超限(ItemLimitError)等。
+    """
+    tol = _check_real(tolerance, "tolerance", "simplify_surfaces")
+    if tol < 0.0:
+        raise ValidationError(
+            f"simplify_surfaces: tolerance 须非负, 得到 {tol!r}"
+        )
+    if isinstance(surfaces, (str, bytes)):
+        raise ValidationError("simplify_surfaces: surfaces 须为 Surface 的可迭代对象")
+    try:
+        items = list(surfaces)
+    except TypeError as exc:
+        raise ValidationError(f"simplify_surfaces: surfaces 不可迭代: {exc}") from exc
+    if len(items) > MAX_ITEMS:
+        raise ItemLimitError(
+            f"simplify_surfaces: 条目数 {len(items)} 超过上限 MAX_ITEMS={MAX_ITEMS}"
+        )
+    for i, it in enumerate(items):
+        if not isinstance(it, Surface):
+            raise ValidationError(
+                f"simplify_surfaces: 第 {i} 项须为 Surface(体段请走 composite 旧接口), "
+                f"得到 {type(it).__name__}({it!r})"
+            )
+    if not items:
+        return SimplificationResult((), 0.0, None, ())
+
+    ordered = sorted(items, key=lambda s: (s.z, _id_sort_key(s.id)))
+
+    # 按深度分组(同深度的 Surface 不拆开)。
+    depth_groups = []  # [(z, [Surface, ...]), ...]
+    for s in ordered:
+        if depth_groups and depth_groups[-1][0] == s.z:
+            depth_groups[-1][1].append(s)
+        else:
+            depth_groups.append((s.z, [s]))
+    depths = [z for z, _ in depth_groups]
+    m = len(depth_groups)
+
+    # 每组之前的透过率(与分组方案无关: 折叠在组终点处精确保持透过率)。
+    # T_before[i+1] = T_before[i] * prod_{s in group i} (1 - a_s)
+    t_before = [1.0] * (m + 1)
+    for i in range(m):
+        prod = 1.0
+        for s in depth_groups[i][1]:
+            prod *= 1.0 - s.rgba[3]
+        t_before[i + 1] = t_before[i] * prod
+
+    def compressed_group_ok(j: int, i: int) -> bool:
+        """深度组 [j, i) 折叠成一个 Surface 是否合法(范围 + 中间边界误差)。"""
+        seg = [s for k in range(j, i) for s in depth_groups[k][1]]
+        rgb, _alpha = _fold_surfaces(seg)
+        for c in rgb:
+            if c > 1.0 + _SIMPLIFY_EPS:
+                return False  # 折叠颜色越界: 禁用该候选段, 不钳制
+        # 组内每个中间深度边界(组终点处折叠精确, 无需检查)的误差。
+        scale = t_before[j]
+        acc = [0.0, 0.0, 0.0]
+        transmittance = 1.0
+        for k in range(j, i - 1):
+            for s in depth_groups[k][1]:
+                r, g, b, a = s.rgba
+                acc[0] += transmittance * r
+                acc[1] += transmittance * g
+                acc[2] += transmittance * b
+                transmittance *= 1.0 - a
+            limit = tol + _SIMPLIFY_EPS
+            if (
+                scale * acc[0] > limit
+                or scale * acc[1] > limit
+                or scale * acc[2] > limit
+                or scale * (1.0 - transmittance) > limit
+            ):
+                return False
+        return True
+
+    # DP: dp[i] = (样本数, 终点序列, 方案) 处理前 i 个深度组的最优解。
+    # 比较键 (样本数, 终点深度序列) 字典序: 先最少样本, 平局取终点序列最小。
+    dp = [None] * (m + 1)
+    dp[0] = (0, (), [])
+    for i in range(1, m + 1):
+        best = None
+        # 候选 A: 深度组 i-1 原样保留(总是合法)。
+        prev = dp[i - 1]
+        cand = (
+            prev[0] + len(depth_groups[i - 1][1]),
+            prev[1] + (depths[i - 1],),
+            prev[2] + [("keep", i - 1)],
+        )
+        best = cand
+        # 候选 B: 深度组 [j, i) 折叠为一个 Surface。
+        for j in range(i - 1, -1, -1):
+            if not compressed_group_ok(j, i):
+                continue
+            prev = dp[j]
+            cand = (
+                prev[0] + 1,
+                prev[1] + (depths[i - 1],),
+                prev[2] + [("fold", j)],
+            )
+            if (cand[0], cand[1]) < (best[0], best[1]):
+                best = cand
+        dp[i] = best
+
+    # 按方案重建输出 Surface 序列: fold 步骤记录起点组 j, 终点为下一组起点。
+    plan = dp[m][2]
+    starts = [arg for _kind, arg in plan]
+    out = []
+    for idx, (kind, arg) in enumerate(plan):
+        if kind == "keep":
+            out.extend(depth_groups[arg][1])
+        else:
+            # 折叠段 [arg, next_start), 终点深度为 next_start-1 组
+            nxt = starts[idx + 1] if idx + 1 < len(starts) else m
+            seg = [s for k in range(arg, nxt) for s in depth_groups[k][1]]
+            rgb, alpha = _fold_surfaces(seg)
+            out.append(
+                Surface(depths[nxt - 1], (rgb[0], rgb[1], rgb[2], alpha), id=seg[-1].id)
+            )
+
+    # 实际误差: 在每个原深度边界比较压缩前后的前缀函数。
+    orig_prefix = _prefix_function(ordered, depths)
+    new_prefix = _prefix_function(list(out), depths)
+    max_error = 0.0
+    worst_z = None
+    for z, (pc, pn) in zip(depths, zip(orig_prefix, new_prefix)):
+        err = max(
+            abs(pc[0][0] - pn[0][0]),
+            abs(pc[0][1] - pn[0][1]),
+            abs(pc[0][2] - pn[0][2]),
+            abs(pc[1] - pn[1]),
+        )
+        if worst_z is None or err > max_error:
+            max_error = err
+            worst_z = z
+
+    return SimplificationResult(tuple(out), max_error, worst_z, dp[m][1])
