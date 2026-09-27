@@ -9,16 +9,17 @@
       四个通道均须在 [0, 1] 内。本模块不强制 rgb <= a(超预乘数据不拒绝),
       但输入被假定为预乘含义, 合成时直接使用, 不再乘 alpha。
     - 体段携带发射系数 emission=(er, eg, eb)(每单位长度, 非负, 可大于 1)
-      与消光系数 sigma(每单位长度, 标量, 非负; 消光为无色/灰度)。
-    - 输出 color 为预乘 RGB(相对透明背景), transmittance 为整束透过率;
+      与消光系数 sigma(每单位长度, 非负)。sigma 可为标量(灰度简写),
+      也可为 RGB 三元组, 分别给出三个颜色通道的消光。
+    - 输出 color 为预乘 RGB(相对透明背景), transmittance 为 RGB 三束透过率;
       叠到背景 bg 上: out = color + transmittance * bg。
 
 合成规则:
     1. 所有体段端点把深度轴切成不交叠小区间; 每个小区间内重叠体段的
-       sigma 相加、emission 相加, 按均匀介质解析积分:
-           C = e / sigma * (1 - exp(-sigma * L))   (sigma > 0)
-           C = e * L                                (sigma == 0)
-           T = exp(-sigma * L)
+       sigma 逐通道相加、emission 相加, 按均匀介质逐通道解析积分:
+           C_k = e_k / sigma_k * (1 - exp(-sigma_k * L))   (sigma_k > 0)
+           C_k = e_k * L                                  (sigma_k == 0)
+           T_k = exp(-sigma_k * L)
     2. 同一 z 处: 先处理"在该 z 结束的体段区间", 再按 ID 升序合成该 z 的
        所有表面, 之后才轮到"在该 z 开始的体段区间"。
     3. 表面按 (z, ID) 排序; ID 为 int(拒绝 bool)或 str, 混合类型时
@@ -55,6 +56,7 @@ MAX_ITEMS = 100
 
 Rgb = Tuple[float, float, float]
 ItemId = Union[int, str]
+Sigma = Union[float, Rgb]
 
 
 # ---------------------------------------------------------------------------
@@ -129,6 +131,34 @@ def _check_rgb_triple(value, name: str, ctx: str, allow_above_one: bool) -> Rgb:
     return (out[0], out[1], out[2])
 
 
+def _check_sigma(value, ctx: str) -> Sigma:
+    """消光校验: 非负标量, 或三个非负通道值。返回标量或 RGB 三元组。"""
+    if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
+        sigma = _check_real(value, "sigma", ctx)
+        if sigma < 0.0:
+            raise NegativeSigmaError(f"{ctx}: sigma 须非负, 得到 {sigma!r}")
+        return sigma
+    if len(value) != 3:
+        raise ValidationError(
+            f"{ctx}: 字段 sigma 须为非负标量或长度为 3 的数值序列, 得到长度 {len(value)}"
+        )
+    channels = []
+    for i, comp in enumerate(value):
+        channel = _check_real(comp, f"sigma[{i}]", ctx)
+        if channel < 0.0:
+            raise NegativeSigmaError(
+                f"{ctx}: sigma[{i}] 须非负, 得到 {channel!r}"
+            )
+        channels.append(channel)
+    return (channels[0], channels[1], channels[2])
+
+
+def _sigma_channels(sigma: Sigma) -> Rgb:
+    if isinstance(sigma, tuple):
+        return sigma
+    return (sigma, sigma, sigma)
+
+
 # ---------------------------------------------------------------------------
 # 公开数据结构
 # ---------------------------------------------------------------------------
@@ -163,13 +193,13 @@ class Surface:
 @dataclass(frozen=True)
 class VolumeSegment:
     """均匀体段 [z0, z1]: emission 为每单位长度发射系数(RGB, 非负),
-    sigma 为每单位长度消光系数(标量, 非负)。z0 == z1 为零长段(无贡献)。
+    sigma 为每单位长度消光系数(非负标量或 RGB 三元组)。z0 == z1 为零长段。
     """
 
     z0: float
     z1: float
     emission: Tuple[float, float, float]
-    sigma: float
+    sigma: Sigma
     id: ItemId = 0
 
     def __post_init__(self):
@@ -184,10 +214,7 @@ class VolumeSegment:
         object.__setattr__(
             self, "emission", _check_rgb_triple(self.emission, "emission", ctx, allow_above_one=True)
         )
-        sigma = _check_real(self.sigma, "sigma", ctx)
-        if sigma < 0.0:
-            raise NegativeSigmaError(f"{ctx}: sigma 须非负, 得到 {sigma!r}")
-        object.__setattr__(self, "sigma", sigma)
+        object.__setattr__(self, "sigma", _check_sigma(self.sigma, ctx))
 
 
 @dataclass(frozen=True)
@@ -203,16 +230,16 @@ class LedgerEntry:
     z0: float
     z1: float  # 表面时 z1 == z0
     contribution: Rgb
-    transmittance_before: float
-    transmittance_after: float
+    transmittance_before: Rgb
+    transmittance_after: Rgb
 
 
 @dataclass(frozen=True)
 class CompositeResult:
-    """合成结果: 预乘最终色、整束透过率、贡献账本。"""
+    """合成结果: 预乘最终色、RGB 整束透过率、贡献账本。"""
 
     color: Rgb
-    transmittance: float
+    transmittance: Rgb
     ledger: Tuple[LedgerEntry, ...]
 
 
@@ -220,20 +247,28 @@ class CompositeResult:
 # 核心算法
 # ---------------------------------------------------------------------------
 
-def _segment_color_and_transmittance(emission: Rgb, sigma: float, length: float):
-    """均匀小区间的解析积分。返回 (C_rgb, T)。"""
-    x = sigma * length
-    if x == 0.0:
-        # sigma == 0(或零长): C = e * L, T = 1
-        return (emission[0] * length, emission[1] * length, emission[2] * length), 1.0
-    # (1 - exp(-x)) / x 用 expm1 保持小 x 精度
-    factor = -math.expm1(-x) / x  # 无量纲
-    t = math.exp(-x)
+def _segment_color_and_transmittance(emission: Rgb, sigma: Rgb, length: float):
+    """均匀小区间的逐通道解析积分。返回 (C_rgb, T_rgb)。
+
+    每个通道独立判断零消光, 因此完全无吸收的通道不会做除法, 也不会
+    丢失该通道的发光贡献。
+    """
+    color = []
+    transmittance = []
+    for emission_k, sigma_k in zip(emission, sigma):
+        x = sigma_k * length
+        if x == 0.0:
+            color.append(emission_k * length)
+            transmittance.append(1.0)
+            continue
+        # (1 - exp(-x)) / x 用 expm1 保持小 x 精度
+        factor = -math.expm1(-x) / x
+        color.append(emission_k * length * factor)
+        transmittance.append(math.exp(-x))
     return (
-        emission[0] * length * factor,
-        emission[1] * length * factor,
-        emission[2] * length * factor,
-    ), t
+        (color[0], color[1], color[2]),
+        (transmittance[0], transmittance[1], transmittance[2]),
+    )
 
 
 def composite(
@@ -304,7 +339,7 @@ def composite(
 
     # --- 从前到后合成 ---
     acc = [0.0, 0.0, 0.0]
-    transmittance = 1.0
+    transmittance = [1.0, 1.0, 1.0]
     ledger = []
 
     # 每个 z 坐标上的表面(按 ID 排序)
@@ -319,63 +354,79 @@ def composite(
         if idx > 0:
             a, b = ordered[idx - 1], z
             if b > a:
-                sig = 0.0
+                sig = [0.0, 0.0, 0.0]
                 emi = [0.0, 0.0, 0.0]
                 ids = []
                 for z0, z1, e, s, iid in volumes:
                     if z0 <= a and z1 >= b:
-                        sig += s
+                        s_channels = _sigma_channels(s)
+                        sig[0] += s_channels[0]
+                        sig[1] += s_channels[1]
+                        sig[2] += s_channels[2]
                         emi[0] += e[0]
                         emi[1] += e[1]
                         emi[2] += e[2]
                         ids.append(iid)
                 if ids:
                     c_seg, t_seg = _segment_color_and_transmittance(
-                        (emi[0], emi[1], emi[2]), sig, b - a
+                        (emi[0], emi[1], emi[2]),
+                        (sig[0], sig[1], sig[2]),
+                        b - a,
                     )
-                    t_before = transmittance
-                    acc[0] += transmittance * c_seg[0]
-                    acc[1] += transmittance * c_seg[1]
-                    acc[2] += transmittance * c_seg[2]
-                    transmittance *= t_seg
+                    t_before = tuple(transmittance)
+                    contribution = (
+                        transmittance[0] * c_seg[0],
+                        transmittance[1] * c_seg[1],
+                        transmittance[2] * c_seg[2],
+                    )
+                    acc[0] += contribution[0]
+                    acc[1] += contribution[1]
+                    acc[2] += contribution[2]
+                    transmittance[0] *= t_seg[0]
+                    transmittance[1] *= t_seg[1]
+                    transmittance[2] *= t_seg[2]
                     ledger.append(
                         LedgerEntry(
                             kind="volume",
                             ids=tuple(ids),
                             z0=a,
                             z1=b,
-                            contribution=(
-                                t_before * c_seg[0],
-                                t_before * c_seg[1],
-                                t_before * c_seg[2],
-                            ),
+                            contribution=contribution,
                             transmittance_before=t_before,
-                            transmittance_after=transmittance,
+                            transmittance_after=tuple(transmittance),
                         )
                     )
         # 2) 再合成 z 处的表面(按 ID 升序)—— 之后才是从 z 开始的体段
         for s in surfaces_at.get(z, ()):
             r, g, b_, alpha = s.rgba
-            t_before = transmittance
-            acc[0] += transmittance * r
-            acc[1] += transmittance * g
-            acc[2] += transmittance * b_
-            transmittance *= 1.0 - alpha
+            t_before = tuple(transmittance)
+            contribution = (
+                transmittance[0] * r,
+                transmittance[1] * g,
+                transmittance[2] * b_,
+            )
+            acc[0] += contribution[0]
+            acc[1] += contribution[1]
+            acc[2] += contribution[2]
+            surviving = 1.0 - alpha
+            transmittance[0] *= surviving
+            transmittance[1] *= surviving
+            transmittance[2] *= surviving
             ledger.append(
                 LedgerEntry(
                     kind="surface",
                     ids=(s.id,),
                     z0=z,
                     z1=z,
-                    contribution=(t_before * r, t_before * g, t_before * b_),
+                    contribution=contribution,
                     transmittance_before=t_before,
-                    transmittance_after=transmittance,
+                    transmittance_after=tuple(transmittance),
                 )
             )
 
     return CompositeResult(
         color=(acc[0], acc[1], acc[2]),
-        transmittance=transmittance,
+        transmittance=(transmittance[0], transmittance[1], transmittance[2]),
         ledger=tuple(ledger),
     )
 
@@ -383,9 +434,8 @@ def composite(
 def apply_background(result: CompositeResult, background: Sequence[float]) -> Rgb:
     """把合成结果叠到背景色上: out = color + transmittance * background。"""
     bg = _check_rgb_triple(background, "background", "apply_background", allow_above_one=True)
-    t = result.transmittance
     return (
-        result.color[0] + t * bg[0],
-        result.color[1] + t * bg[1],
-        result.color[2] + t * bg[2],
+        result.color[0] + result.transmittance[0] * bg[0],
+        result.color[1] + result.transmittance[1] * bg[1],
+        result.color[2] + result.transmittance[2] * bg[2],
     )

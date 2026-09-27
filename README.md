@@ -25,7 +25,7 @@ result = composite(deep_samples, *, z_far=None)
 | 类型 | 字段 | 含义 |
 |---|---|---|
 | `Surface(z, rgba, id=0)` | `z` 有限实数; `rgba` 为**预乘** `(r,g,b,a)`, 四通道均在 `[0,1]` | 深度 z 处的半透明表面 |
-| `VolumeSegment(z0, z1, emission, sigma, id=0)` | `z1 >= z0`; `emission` 为每单位长度发射系数 RGB(非负有限, 可大于 1); `sigma` 为每单位长度消光系数(标量, 非负有限) | 均匀体段 |
+| `VolumeSegment(z0, z1, emission, sigma, id=0)` | `z1 >= z0`; `emission` 为每单位长度发射系数 RGB(非负有限, 可大于 1); `sigma` 为每单位长度消光系数(非负有限标量, 或长度为 3 的非负有限 RGB 序列) | 均匀体段 |
 
 - `id`: `int`(**拒绝 `bool`**)或 `str`, 用于同深度 tie-break; int 与 str 混合时 int 排前。
 - `z_far`: 可选截断远平面。`z > z_far` 的表面被丢弃, 体段被截断到 `z_far`(完全在外的丢弃)。
@@ -34,24 +34,25 @@ result = composite(deep_samples, *, z_far=None)
 
 `CompositeResult(color, transmittance, ledger)`:
 
-- `color`: 预乘 RGB 最终色(相对透明背景)。叠到背景上: `apply_background(result, bg)` = `color + transmittance * bg`。
-- `transmittance`: 整束透过率 T ∈ [0,1]。
+- `color`: 预乘 RGB 最终色(相对透明背景)。叠到背景上: `apply_background(result, bg)` = `color + transmittance * bg`(逐通道相乘)。
+- `transmittance`: 三个颜色通道各自的透过率 `(Tr,Tg,Tb)`, 每个分量 ∈ [0,1]。
 - `ledger`: 贡献账本, 每个被合成元素一条 `LedgerEntry(kind, ids, z0, z1, contribution, transmittance_before, transmittance_after)`。**全部条目 `contribution` 求和恰等于 `color`**(可加性, demo 与测试均核验)。
 
 ## 预乘与合成约定
 
 - 表面 RGBA 为预乘: rgb 已含 alpha, 合成时直接使用, 不再乘 alpha; 不强制 `rgb <= a`(超预乘数据不拒绝, 但按预乘语义解释)。
-- 体段端点把深度轴切成不交叠小区间; 每个小区间内重叠体段的 **sigma 相加、emission 相加**, 按均匀介质解析积分:
-  - `C = e/σ · (1 − exp(−σ·L))`,`T = exp(−σ·L)`;`σ = 0` 时 `C = e·L, T = 1`。
+- 体段端点把深度轴切成不交叠小区间; 每个小区间内重叠体段的 **sigma 逐通道相加、emission 相加**, 按均匀介质逐通道解析积分:
+  - `C_k = e_k/σ_k · (1 − exp(−σ_k·L))`,`T_k = exp(−σ_k·L)`;某通道 `σ_k = 0` 时该通道 `C_k = e_k·L, T_k = 1`。
+  - `sigma` 传标量是 `(σ,σ,σ)` 的灰度简写; 三个通道相同时回到原灰度结果。重叠小区间内各通道的 σ 分别相加, 不使用平均值。
   - 小 `σ·L` 用 `expm1` 稳定求值, 避免 0/0 精度损失。
 - 同一 z 处的顺序: **先结束于 z 的体段区间 → z 处的表面(按 ID 升序)→ 从 z 开始的体段区间**。
-- 表面整体按 `(z, id)` 排序, 全部元素 front-to-back 合成: `C += T·c; T *= (1−a)`(表面)或 `T *= T_seg`(体段)。
+- 表面整体按 `(z, id)` 排序, 全部元素 front-to-back 合成: 表面 `C_k += T_k·c_k; (Tr,Tg,Tb) *= (1−a)`;体段 `T *= T_seg`, 乘法按三个通道分别进行。表面 alpha 是几何遮挡, 对三个通道相同。
 
 ## 输入上限与错误语义
 
 - **上限**: 每次 `composite()` 调用至多 `MAX_ITEMS = 100` 项, 超出抛 `ItemLimitError`。
 - 所有数值输入拒绝 `NaN`/`Infinity`; 整型语义参数(id)拒绝 `bool`; 数值字段同样拒绝 `bool`。
-- `sigma < 0` 抛 `NegativeSigmaError`; 负发射、rgba 越界、`z1 < z0`、错误类型等抛 `ValidationError`。
+- 标量 `sigma < 0` 或任一 `sigma[k] < 0` 抛 `NegativeSigmaError`; RGB `sigma` 形状错误、负发射、rgba 越界、`z1 < z0`、错误类型等抛 `ValidationError`。
 - 错误消息包含条目上下文(id)与字段名, 可定位; 不静默纠正任何非法输入。
 - `composite()` 为纯函数: 校验失败在产生结果之前抛出, 不留部分变更; `z0 == z1` 的零长体段是合法 no-op。
 
@@ -63,7 +64,7 @@ result = composite(deep_samples, *, z_far=None)
 
 ## 设计取舍与已知限制
 
-- **消光为标量(灰度)**: `sigma` 不随波长变化, 不支持有色消光; 发射为 RGB。
+- **支持标量或逐通道消光**: 标量是灰度简写; 传 `(σr,σg,σb)` 时介质可对不同颜色产生不同衰减; 发射始终为 RGB。
 - **重叠体段在小区间内合并**(σ、e 分别相加)后再积分, 账本按合并后的小区间记账(`ids` 列出全部参与条目), 不做逐条目的重叠区归因。
 - 仅实现本题契约的合成模型: 不含散射、折射、非均匀介质或体纹理; 不宣称兼容任何行业深阴影图/deep pixel 标准。
 - 表面不强制 `rgb <= a` 的预乘不变式(仅要求各通道 ∈ [0,1])。
@@ -75,6 +76,6 @@ result = composite(deep_samples, *, z_far=None)
 deep_composite/      # 可导入库(核心算法, 无第三方依赖)
   __init__.py        # 公开接口导出
   core.py            # 数据结构、校验、合成算法
-tests/test_composite.py  # 26 个单元测试(解析参考独立手算)
+tests/test_composite.py  # 33 个单元测试(解析参考独立手算)
 demo.py              # 固定输入演示: 正常结果 + 账本可加核验 + 负 sigma 拒绝
 ```

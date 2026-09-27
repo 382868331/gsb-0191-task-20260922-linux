@@ -27,6 +27,10 @@ def assert_rgb_close(tc, got, want, tol=TOL):
         tc.assertAlmostEqual(g, w, delta=tol)
 
 
+def gray_transmittance(value):
+    return (value, value, value)
+
+
 class TestSingleVolumeSegment(unittest.TestCase):
     """单个体段的解析参考: C = e/sigma*(1-exp(-sigma*L)), T = exp(-sigma*L)。"""
 
@@ -40,7 +44,7 @@ class TestSingleVolumeSegment(unittest.TestCase):
         want_c = tuple(ec / sigma * (1.0 - math.exp(-x)) for ec in e)
         want_t = math.exp(-x)
         assert_rgb_close(self, res.color, want_c)
-        self.assertAlmostEqual(res.transmittance, want_t, delta=TOL)
+        assert_rgb_close(self, res.transmittance, gray_transmittance(want_t))
         self.assertEqual(len(res.ledger), 1)
         entry = res.ledger[0]
         self.assertEqual(entry.kind, "volume")
@@ -53,7 +57,7 @@ class TestSingleVolumeSegment(unittest.TestCase):
         z0, z1 = 0.0, 2.0
         res = composite([VolumeSegment(z0, z1, e, 0.0)])
         assert_rgb_close(self, res.color, tuple(ec * (z1 - z0) for ec in e))
-        self.assertEqual(res.transmittance, 1.0)
+        self.assertEqual(res.transmittance, (1.0, 1.0, 1.0))
 
     def test_tiny_sigma_uses_stable_branch(self):
         """极小 sigma 时结果应逼近 e*L(级数极限), 不得因 0/0 崩坏。"""
@@ -88,7 +92,7 @@ class TestOverlappingVolumes(unittest.TestCase):
         want = [c1[i] + t1 * c2[i] + t1 * t2 * c3[i] for i in range(3)]
         want_t = t1 * t2 * t3
         assert_rgb_close(self, res.color, want)
-        self.assertAlmostEqual(res.transmittance, want_t, delta=TOL)
+        assert_rgb_close(self, res.transmittance, gray_transmittance(want_t))
         # 账本应含 3 个体段小区间
         kinds = [e.kind for e in res.ledger]
         self.assertEqual(kinds, ["volume", "volume", "volume"])
@@ -108,7 +112,83 @@ class TestOverlappingVolumes(unittest.TestCase):
             ]
         )
         assert_rgb_close(self, pieces.color, whole.color, tol=1e-12)
-        self.assertAlmostEqual(pieces.transmittance, whole.transmittance, delta=1e-12)
+        assert_rgb_close(self, pieces.transmittance, whole.transmittance, tol=1e-12)
+
+    def test_per_channel_extinction_analytic_reference(self):
+        """RGB 三个通道使用不同 sigma 时, 颜色和透过率逐通道积分。"""
+        emission = (0.4, 0.8, 1.2)
+        sigma = (0.2, 0.5, 1.0)
+        z0, z1 = 0.5, 3.0
+        length = z1 - z0
+        res = composite([VolumeSegment(z0, z1, emission, sigma, id="rgb")])
+
+        want_color = []
+        want_transmittance = []
+        for e_k, sigma_k in zip(emission, sigma):
+            x = sigma_k * length
+            want_color.append(e_k / sigma_k * (1.0 - math.exp(-x)))
+            want_transmittance.append(math.exp(-x))
+        assert_rgb_close(self, res.color, want_color)
+        assert_rgb_close(self, res.transmittance, want_transmittance)
+        entry = res.ledger[0]
+        assert_rgb_close(self, entry.contribution, want_color)
+        self.assertEqual(entry.transmittance_before, (1.0, 1.0, 1.0))
+        assert_rgb_close(self, entry.transmittance_after, want_transmittance)
+
+    def test_zero_absorption_preserves_emission_without_division(self):
+        """单个或全部通道 sigma=0 时走长度积分, 不除零且发射保留。"""
+        emission = (0.3, 0.6, 0.9)
+        res = composite([VolumeSegment(0.0, 2.0, emission, (0.0, 0.5, 0.0))])
+        x = 0.5 * 2.0
+        want_color = (
+            0.6,
+            0.6 / 0.5 * (1.0 - math.exp(-x)),
+            1.8,
+        )
+        assert_rgb_close(self, res.color, want_color)
+        assert_rgb_close(self, res.transmittance, (1.0, math.exp(-x), 1.0))
+
+        all_zero = composite([VolumeSegment(1.0, 4.0, emission, 0.0)])
+        assert_rgb_close(self, all_zero.color, (0.9, 1.8, 2.7))
+        self.assertEqual(all_zero.transmittance, (1.0, 1.0, 1.0))
+
+    def test_scalar_sigma_matches_equal_channel_sigma(self):
+        emission = (0.2, 0.7, 1.1)
+        scalar = composite([VolumeSegment(0.0, 2.5, emission, 0.35)])
+        channels = composite(
+            [VolumeSegment(0.0, 2.5, emission, (0.35, 0.35, 0.35))]
+        )
+        assert_rgb_close(self, scalar.color, channels.color)
+        assert_rgb_close(self, scalar.transmittance, channels.transmittance)
+
+    def test_overlapping_colored_sigmas_add_per_channel(self):
+        """重叠小区间的彩色消光按通道相加, 不使用平均吸收。"""
+        items = [
+            VolumeSegment(0.0, 1.0, (0.2, 0.2, 0.2), (0.1, 0.2, 0.3), id=1),
+            VolumeSegment(0.0, 1.0, (0.1, 0.4, 0.0), (0.4, 0.0, 0.2), id=2),
+        ]
+        res = composite(items)
+        sigma = (0.5, 0.2, 0.5)
+        emission = (0.3, 0.6, 0.2)
+        want_color = []
+        want_transmittance = []
+        for e_k, sigma_k in zip(emission, sigma):
+            x = sigma_k
+            want_color.append(e_k / sigma_k * (1.0 - math.exp(-x)))
+            want_transmittance.append(math.exp(-x))
+        assert_rgb_close(self, res.color, want_color)
+        assert_rgb_close(self, res.transmittance, want_transmittance)
+
+    def test_surface_applies_equally_to_colored_volume_transmittance(self):
+        """表面 alpha 是几何遮挡, 同时作用于三个已有色的体透过率通道。"""
+        volume = VolumeSegment(0.0, 1.0, (0.0, 0.0, 0.0), (0.2, 0.5, 0.8), id=1)
+        surface = Surface(1.0, (0.0, 0.0, 0.0, 0.25), id=2)
+        res = composite([volume, surface])
+        assert_rgb_close(
+            self,
+            res.transmittance,
+            tuple(0.75 * math.exp(-sigma_k) for sigma_k in (0.2, 0.5, 0.8)),
+        )
 
 
 class TestSurfaces(unittest.TestCase):
@@ -116,7 +196,7 @@ class TestSurfaces(unittest.TestCase):
         # 预乘表面: C = c, T = 1 - a
         res = composite([Surface(1.0, (0.2, 0.4, 0.1, 0.5), id=0)])
         assert_rgb_close(self, res.color, (0.2, 0.4, 0.1))
-        self.assertAlmostEqual(res.transmittance, 0.5, delta=TOL)
+        assert_rgb_close(self, res.transmittance, gray_transmittance(0.5))
 
     def test_same_depth_surfaces_sorted_by_id(self):
         """同 z 表面按 ID 升序合成(front-to-back)。"""
@@ -127,7 +207,7 @@ class TestSurfaces(unittest.TestCase):
         # 手算: C = c1 + (1-a1)*c2 ; T = (1-a1)(1-a2)
         want = (0.5 + 0.5 * 0.0, 0.0 + 0.5 * 0.5, 0.0)
         assert_rgb_close(self, res.color, want)
-        self.assertAlmostEqual(res.transmittance, 0.25, delta=TOL)
+        assert_rgb_close(self, res.transmittance, gray_transmittance(0.25))
         self.assertEqual([e.ids[0] for e in res.ledger], [1, 2])
 
     def test_string_ids_sort_after_int_ids(self):
@@ -148,7 +228,7 @@ class TestDepthTieOrdering(unittest.TestCase):
         res = composite([v2, surf, v1])
         # 手算: C = (1,0,0) + 1*(0,0.5,0) + (1*0.5)*(0,0,1) = (1, 0.5, 0.5)
         assert_rgb_close(self, res.color, (1.0, 0.5, 0.5))
-        self.assertAlmostEqual(res.transmittance, 0.5, delta=TOL)
+        assert_rgb_close(self, res.transmittance, gray_transmittance(0.5))
         self.assertEqual([e.kind for e in res.ledger], ["volume", "surface", "volume"])
 
     def test_opaque_surface_hides_volume_starting_at_same_z(self):
@@ -158,7 +238,26 @@ class TestDepthTieOrdering(unittest.TestCase):
         res = composite([v2, opaque, v1])
         # 不透明表面后透过率为 0, v2 无贡献
         assert_rgb_close(self, res.color, (0.2, 0.3, 0.0))
-        self.assertEqual(res.transmittance, 0.0)
+        self.assertEqual(res.transmittance, (0.0, 0.0, 0.0))
+
+    def test_surface_then_colored_volume_combination(self):
+        surface = Surface(1.0, (0.2, 0.1, 0.0, 0.5), id=1)
+        volume = VolumeSegment(1.0, 2.0, (1.0, 1.0, 1.0), (0.0, 0.5, 1.0), id=2)
+        res = composite([surface, volume])
+
+        surface_t = 0.5
+        volume_t = (1.0, math.exp(-0.5), math.exp(-1.0))
+        volume_color = (1.0, 2.0 * (1.0 - math.exp(-0.5)), 1.0 - math.exp(-1.0))
+        want_color = tuple(
+            surface_color + surface_t * volume_color[k]
+            for k, surface_color in enumerate((0.2, 0.1, 0.0))
+        )
+        assert_rgb_close(self, res.color, want_color)
+        assert_rgb_close(
+            self,
+            res.transmittance,
+            tuple(surface_t * volume_t[k] for k in range(3)),
+        )
 
 
 class TestFarPlane(unittest.TestCase):
@@ -171,7 +270,7 @@ class TestFarPlane(unittest.TestCase):
         # 手算: 体段 [0,1]: C=0.5; 表面 z=1: c=0.1,a=0.5; 体段 [1,2]: C=0.5
         # C_r = 0.5 + 0.1 + 0.5*0.5 = 0.85 ; C_g = 0.5 + 0 + 0.25 = 0.75 ; T = 0.5
         assert_rgb_close(self, res.color, (0.85, 0.75, 0.75))
-        self.assertAlmostEqual(res.transmittance, 0.5, delta=TOL)
+        assert_rgb_close(self, res.transmittance, gray_transmittance(0.5))
         self.assertFalse(any(3 in e.ids for e in res.ledger))
 
     def test_surface_exactly_at_far_plane_kept(self):
@@ -197,13 +296,13 @@ class TestLedger(unittest.TestCase):
         # 账本链: 每条目的 transmittance_before 为上一条的 after
         for prev, cur in zip(res.ledger, res.ledger[1:]):
             self.assertEqual(prev.transmittance_after, cur.transmittance_before)
-        self.assertEqual(res.ledger[0].transmittance_before, 1.0)
+        self.assertEqual(res.ledger[0].transmittance_before, (1.0, 1.0, 1.0))
         self.assertEqual(res.ledger[-1].transmittance_after, res.transmittance)
 
     def test_empty_input(self):
         res = composite([])
         self.assertEqual(res.color, (0.0, 0.0, 0.0))
-        self.assertEqual(res.transmittance, 1.0)
+        self.assertEqual(res.transmittance, (1.0, 1.0, 1.0))
         self.assertEqual(res.ledger, ())
 
     def test_apply_background(self):
@@ -216,6 +315,14 @@ class TestValidation(unittest.TestCase):
     def test_negative_sigma_rejected(self):
         with self.assertRaises(NegativeSigmaError):
             VolumeSegment(0.0, 1.0, (0.1, 0.1, 0.1), -0.5)
+        with self.assertRaises(NegativeSigmaError):
+            VolumeSegment(0.0, 1.0, (0.1, 0.1, 0.1), (0.2, -0.1, 0.3))
+
+    def test_colored_sigma_shape_and_finiteness(self):
+        with self.assertRaises(ValidationError):
+            VolumeSegment(0.0, 1.0, (0.1, 0.1, 0.1), (0.2, 0.3))
+        with self.assertRaises(ValidationError):
+            VolumeSegment(0.0, 1.0, (0.1, 0.1, 0.1), (0.2, float("nan"), 0.3))
 
     def test_nan_and_inf_rejected(self):
         for bad in (float("nan"), float("inf"), float("-inf")):
@@ -253,7 +360,7 @@ class TestValidation(unittest.TestCase):
     def test_zero_length_segment_is_noop(self):
         res = composite([VolumeSegment(1.0, 1.0, (1.0, 1.0, 1.0), 1.0)])
         self.assertEqual(res.color, (0.0, 0.0, 0.0))
-        self.assertEqual(res.transmittance, 1.0)
+        self.assertEqual(res.transmittance, (1.0, 1.0, 1.0))
 
     def test_item_limit(self):
         items = [Surface(float(i), (0.1, 0.1, 0.1, 0.1), id=i) for i in range(MAX_ITEMS + 1)]
